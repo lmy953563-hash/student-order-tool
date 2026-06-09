@@ -6,13 +6,28 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 st.set_page_config(page_title="学生订购数据", layout="wide")
 st.title("📊 学生订购数据智能分析看板")
 
-# 导出样式函数
+# --- 缓存优化核心：将数据处理抽离出来 ---
+@st.cache_data
+def load_and_process(file_content):
+    # 读取 Excel
+    df = pd.read_excel(file_content, sheet_name="学生订购信息汇总表")
+    
+    # 格式化列名
+    col_mapping = {c: str(c).strip().replace('\ufeff', '') for c in df.columns}
+    df = df.rename(columns=col_mapping).rename(columns={c: '姓名' for c in df.columns if '姓名' in c})
+    df = df.rename(columns={c: '班级' for c in df.columns if '班级' in c})
+    df = df.rename(columns={c: '学科' for c in df.columns if '学科' in c})
+    
+    # 清洗数据
+    df_clean = df.dropna(subset=['姓名', '班级', '学科']).copy()
+    df_clean['学科'] = df_clean['学科'].astype(str)
+    return df_clean
+
+# 导出样式函数（保持不变）
 def apply_excel_style(ws):
-    # 列宽设置：前两列 3.5cm (约 13-14 字符宽度)，第三列 7cm (约 26-27 字符宽度)
     ws.column_dimensions['A'].width = 14
     ws.column_dimensions['B'].width = 14
     ws.column_dimensions['C'].width = 26.5 
-    
     for row in ws.iter_rows():
         ws.row_dimensions[row[0].row].height = 20
         for cell in row:
@@ -21,19 +36,13 @@ def apply_excel_style(ws):
             cell.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             cell.fill = PatternFill(start_color='E6F0FF' if cell.row == 1 else 'FDF5E6', fill_type='solid')
 
+# --- 主界面 ---
 uploaded_file = st.sidebar.file_uploader("请上传 Excel 文件", type=["xlsx"])
 
 if uploaded_file is not None:
     try:
-        # 数据处理
-        df = pd.read_excel(uploaded_file, sheet_name="学生订购信息汇总表")
-        col_mapping = {c: str(c).strip().replace('\ufeff', '') for c in df.columns}
-        df = df.rename(columns=col_mapping).rename(columns={c: '姓名' for c in df.columns if '姓名' in c})
-        df = df.rename(columns={c: '班级' for c in df.columns if '班级' in c})
-        df = df.rename(columns={c: '学科' for c in df.columns if '学科' in c})
-        
-        df_clean = df.dropna(subset=['姓名', '班级', '学科'])
-        df_clean['学科'] = df_clean['学科'].astype(str)
+        # 调用缓存函数，后续点击按钮时，这里会直接从内存取结果，不再重新读取 Excel
+        df_clean = load_and_process(uploaded_file)
         
         # 1. 核心看板
         st.subheader("📈 核心统计数据")
@@ -66,7 +75,7 @@ if uploaded_file is not None:
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 display_df.to_excel(writer, index=False, sheet_name="导出")
                 apply_excel_style(writer.sheets["导出"])
-            st.download_button("下载 Excel", output.getvalue(), f"{selected_class}_导出.xlsx")
+            st.download_button("点击下载 Excel", output.getvalue(), f"{selected_class}_导出.xlsx")
             
         if col2.button("一键导出所有班级数据"):
             output = io.BytesIO()
@@ -75,7 +84,7 @@ if uploaded_file is not None:
                     cls_data = df_clean[df_clean['班级'] == cls].groupby(['班级', '姓名'])['学科'].first().reset_index()
                     cls_data.to_excel(writer, index=False, sheet_name=str(cls))
                     apply_excel_style(writer.sheets[str(cls)])
-            st.download_button("下载全部班级汇总", output.getvalue(), "全部班级导出.xlsx")
+            st.download_button("点击下载全部汇总", output.getvalue(), "全部班级导出.xlsx")
 
         st.markdown("---")
         st.subheader("📊 各班级学科统计表")
