@@ -69,23 +69,60 @@ def apply_excel_style(ws):
             cell.border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
             cell.fill = PatternFill(start_color='E6F0FF' if cell.row == 1 else 'FDF5E6', fill_type='solid')
 
+# --- 【优化】添加缓存机制的数据加载函数 ---
+@st.cache_data
+def load_and_clean_data(file):
+    df = pd.read_excel(file, sheet_name="学生订购信息汇总表")
+    df = df.rename(columns={c: str(c).strip().replace('\ufeff', '') for c in df.columns})
+    df = df.rename(columns={c: '姓名' for c in df.columns if '姓名' in c})
+    df = df.rename(columns={c: '班级' for c in df.columns if '班级' in c})
+    df = df.rename(columns={c: '学科' for c in df.columns if '学科' in c})
+    
+    df_clean = df.dropna(subset=['姓名', '班级', '学科']).copy()
+    df_clean['学科'] = df_clean['学科'].astype(str)
+    
+    # 提前处理 exploded 数据
+    df_exploded = df_clean.copy()
+    df_exploded['学科'] = df_exploded['学科'].str.split('/')
+    df_exploded = df_exploded.explode('学科')
+    df_exploded['学科'] = df_exploded['学科'].str.strip()
+    
+    return df_clean, df_exploded
+
+# --- 【优化】添加缓存的 Excel 生成函数 ---
+@st.cache_data
+def generate_class_excel(df_clean, selected_class):
+    display_df = df_clean[df_clean['班级'] == selected_class].groupby(['班级', '姓名'])['学科'].first().reset_index()
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        display_df.to_excel(writer, index=False, sheet_name="导出")
+        apply_excel_style(writer.sheets["导出"])
+    return output.getvalue()
+
+@st.cache_data
+def generate_all_classes_excel(df_clean, all_classes):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        for cls in all_classes:
+            cls_data = df_clean[df_clean['班级'] == cls].groupby(['班级', '姓名'])['学科'].first().reset_index()
+            # 限制 sheet name 长度在 31 字符内，防止 openpyxl 报错
+            safe_cls_name = str(cls)[:31]
+            cls_data.to_excel(writer, index=False, sheet_name=safe_cls_name)
+            apply_excel_style(writer.sheets[safe_cls_name])
+    return output.getvalue()
+
 # --- 主程序 ---
 uploaded_file = st.sidebar.file_uploader("请上传 Excel 文件", type=["xlsx"])
+
 if uploaded_file is not None:
     try:
-        df = pd.read_excel(uploaded_file, sheet_name="学生订购信息汇总表")
-        df = df.rename(columns={c: str(c).strip().replace('\ufeff', '') for c in df.columns})
-        df = df.rename(columns={c: '姓名' for c in df.columns if '姓名' in c})
-        df = df.rename(columns={c: '班级' for c in df.columns if '班级' in c})
-        df = df.rename(columns={c: '学科' for c in df.columns if '学科' in c})
-        df_clean = df.dropna(subset=['姓名', '班级', '学科'])
-        df_clean['学科'] = df_clean['学科'].astype(str)
+        # 使用缓存加载数据
+        df_clean, df_exploded = load_and_clean_data(uploaded_file)
 
-        # --- [新增] 实时班级开通人数 (放在最上方，垂直布局) ---
+        # --- 还原原有功能：实时班级开通人数 (保留原文本框形式) ---
         st.subheader("✨ 实时班级开通人数")
         c_range = st.text_input("请输入统计范围 (如 1-36)：", "1-36")
         
-        # 预计算数据用于即时下载
         df_int = df_clean.copy()
         df_int['班级_int'] = df_int['班级'].astype(str).str.extract(r'(\d+)')[0].astype(int)
         cnts = df_int.groupby('班级_int')['姓名'].nunique().to_dict()
@@ -98,46 +135,41 @@ if uploaded_file is not None:
         
         # --- 原有功能 ---
         st.subheader("📈 核心统计数据")
-        df_exploded = df_clean.copy()
-        df_exploded['学科'] = df_exploded['学科'].str.split('/')
-        df_exploded = df_exploded.explode('学科')
-        df_exploded['学科'] = df_exploded['学科'].str.strip()
         subj_totals = df_exploded.groupby('学科').size()
         cols = st.columns(2 + len(subj_totals))
         cols[0].metric("订购学生总人数", f"{len(df_clean['姓名'].unique())} 人")
         cols[1].metric("学科总订购数量", f"{len(df_exploded)} 科次")
-        for i, (subj, count) in enumerate(subj_totals.items()): cols[2 + i].metric(f"{subj} 总数", f"{count} 科")
+        for i, (subj, count) in enumerate(subj_totals.items()): 
+            cols[2 + i].metric(f"{subj} 总数", f"{count} 科")
         
         st.markdown("---")
+        
+        # --- 订购信息 ---
         st.subheader("🔍 订购信息")
-        all_classes = sorted(df_clean['班级'].unique(), key=lambda x: int(re.search(r'\d+', x).group()))
+        # 优化排序逻辑，避免非数字班级导致程序崩溃
+        all_classes = sorted(df_clean['班级'].unique(), key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else 999)
         selected_class = st.selectbox("🎯 按班级筛选显示：", all_classes)
+        
         display_df = df_clean[df_clean['班级'] == selected_class].groupby(['班级', '姓名'])['学科'].first().reset_index()
         st.dataframe(display_df, use_container_width=True, hide_index=True)
         
+        # 【优化】直接渲染下载按钮，完美解决原版代码中“点击导出后按钮消失/无法下载”的 Bug
         col1, col2 = st.columns([1, 4])
-        if col1.button("导出选中班级"):
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                display_df.to_excel(writer, index=False, sheet_name="导出")
-                apply_excel_style(writer.sheets["导出"])
-            st.download_button("下载 Excel", output.getvalue(), f"{selected_class}_导出.xlsx")
+        with col1:
+            single_class_excel = generate_class_excel(df_clean, selected_class)
+            st.download_button("📥 导出选中班级", single_class_excel, f"{selected_class}_导出.xlsx")
             
-        if col2.button("一键导出所有班级数据"):
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                for cls in all_classes:
-                    cls_data = df_clean[df_clean['班级'] == cls].groupby(['班级', '姓名'])['学科'].first().reset_index()
-                    cls_data.to_excel(writer, index=False, sheet_name=str(cls))
-                    apply_excel_style(writer.sheets[str(cls)])
-            st.download_button("下载全部班级汇总", output.getvalue(), "全部班级导出.xlsx")
+        with col2:
+            all_classes_excel = generate_all_classes_excel(df_clean, all_classes)
+            st.download_button("📦 一键导出所有班级数据", all_classes_excel, "全部班级导出.xlsx")
 
         st.markdown("---")
+        
+        # --- 各班级学科统计表 ---
         st.subheader("📊 各班级学科统计表")
         pivot_df = df_exploded.groupby(['班级', '学科']).size().unstack(fill_value=0)
         pivot_df['总计'] = pivot_df.sum(axis=1)
         st.dataframe(pivot_df, use_container_width=True)
 
     except Exception as e:
-        st.error(f"❌ 读取错误: {e}")
-
+        st.error(f"❌ 读取错误或数据格式异常: {e}")
